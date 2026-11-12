@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wordcraft-engine = { workspace = true }
 wordcraft-ui-egui = { workspace = true }
+serde_json = { workspace = true }
 wordcraft-control-key = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "android-native-activity"] }
@@ -47,5 +48,5 @@ icon = "@mipmap/ic_launcher"
 name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 
 [package.metadata.android.application.activity]
-# Landscape only (both directions), like the desktop layout.
-orientation = "sensorLandscape"
+# Portrait and landscape, in any direction, following the user's auto-rotate setting.
+orientation = "fullUser"
