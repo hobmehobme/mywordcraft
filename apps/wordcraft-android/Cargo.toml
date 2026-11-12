@@ -1,0 +1,41 @@
+[package]
+name = "wordcraft-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "WordCraft for Android: the egui interface on NativeActivity (eframe, wgpu)"
+
+# No `[lints] workspace = true`: the workspace forbids `unsafe_code`, and Android's entry point
+# (`android_main`) must be `#[unsafe(no_mangle)]`. That one attribute is the only unsafe code here.
+
+[lib]
+# cdylib is what Android loads; rlib lets the host build and test the crate too.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wordcraft-engine = { workspace = true }
+wordcraft-ui-egui = { workspace = true }
+wordcraft-control-key = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "android-native-activity"] }
+log = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+winit = { version = "0.30", default-features = false }
+
+# Read by `cargo apk`.
+[package.metadata.android]
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 29
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "WordCraft"
+
+[package.metadata.android.application.activity]
+# Landscape only (both directions), like the desktop layout.
+orientation = "sensorLandscape"
