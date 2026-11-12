@@ -2,6 +2,13 @@ name: Android APK
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag rilis, mis. v0.1.0-android-alpha (kosongkan untuk build saja)"
+        required: false
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -32,11 +39,31 @@ jobs:
               --rev 282639508eeed7d73f2e1eaeea042da2716436d5 cargo-apk
           fi
 
+      - name: Siapkan ikon aplikasi
+        run: |
+          mkdir -p apps/wordcraft-android/res/drawable-nodpi
+          cp assets/app-icon/hicolor/512x512/apps/ai.storyteller.wordcraft.png \
+             apps/wordcraft-android/res/drawable-nodpi/ic_launcher_tile.png
+
       - name: Bangun APK (debug, kunci debug)
         run: cargo apk build -p wordcraft-android --lib
+
+      - name: Siapkan file rilis
+        run: |
+          APK="$(ls target/debug/apk/*.apk | grep -v unaligned | head -n1)"
+          cp "$APK" WordCraft-Android-debug.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: wordcraft-android-apk
-          path: target/debug/apk/*.apk
+          path: WordCraft-Android-debug.apk
           if-no-files-found: error
+
+      - name: Rilis ke GitHub Releases
+        if: ${{ inputs.tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: WordCraft Android ${{ inputs.tag }}
+          prerelease: true
+          files: WordCraft-Android-debug.apk
