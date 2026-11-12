@@ -1,0 +1,42 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NDK_VERSION: "29.0.14206865"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Pasang komponen Android SDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "build-tools;36.0.0" "ndk;${NDK_VERSION}" "platforms;android-35"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Pasang cargo-apk
+        run: |
+          if ! command -v cargo-apk >/dev/null; then
+            cargo install --git https://github.com/parasyte/cargo-apk.git \
+              --rev 282639508eeed7d73f2e1eaeea042da2716436d5 cargo-apk
+          fi
+
+      - name: Bangun APK (debug, kunci debug)
+        run: cargo apk build -p wordcraft-android --lib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wordcraft-android-apk
+          path: target/debug/apk/*.apk
+          if-no-files-found: error
