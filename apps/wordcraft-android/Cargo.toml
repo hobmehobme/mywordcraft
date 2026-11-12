@@ -28,6 +28,8 @@ winit = { version = "0.30", default-features = false }
 # Read by `cargo apk`.
 [package.metadata.android]
 build_targets = ["aarch64-linux-android"]
+# Android resources of this app: the launcher icon (res/).
+resources = "res"
 
 [package.metadata.android.sdk]
 min_sdk_version = 29
@@ -35,6 +37,12 @@ target_sdk_version = 35
 
 [package.metadata.android.application]
 label = "WordCraft"
+icon = "@mipmap/ic_launcher"
+
+# "All files access": lets the built-in file browser open and save in shared storage
+# (Documents, Download). Android asks for it in Settings, not in a pop-up (see README).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 
 [package.metadata.android.application.activity]
 # Landscape only (both directions), like the desktop layout.
