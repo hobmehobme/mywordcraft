@@ -24,6 +24,8 @@ log = { workspace = true }
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
 winit = { version = "0.30", default-features = false }
+# Asks Android whether "All files access" is on, and opens its Settings page (no Java needed).
+jni = "0.21"
 
 # Read by `cargo apk`.
 [package.metadata.android]
