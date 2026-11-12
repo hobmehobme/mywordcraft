@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- the blue of the icon tile, so the launcher's mask never shows a seam -->
+    <color name="ic_launcher_background">#FF3B5BDB</color>
+</resources>
