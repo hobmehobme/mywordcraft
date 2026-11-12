@@ -3,6 +3,17 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// A settings folder the host chose for this process (see [`set_settings_dir`]).
+static SETTINGS_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Fixes the settings folder for this process, for a host with no home directory (Android passes
+/// the app's private folder). Call it once, before anything asks for [`settings_dir`]; `false`
+/// means a folder was already set and this one was ignored. `WORDCRAFT_PROFILE_DIR` still wins.
+pub fn set_settings_dir(path: PathBuf) -> bool {
+    SETTINGS_DIR_OVERRIDE.set(path).is_ok()
+}
 
 /// The app's settings folder (preferences, logs, key files): macOS
 /// `~/Library/Application Support/WordCraft`, Windows `%APPDATA%\WordCraft`, otherwise
@@ -11,6 +22,9 @@ use std::path::{Path, PathBuf};
 pub fn settings_dir() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("WORDCRAFT_PROFILE_DIR").filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(path));
+    }
+    if let Some(path) = SETTINGS_DIR_OVERRIDE.get() {
+        return Some(path.clone());
     }
     if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/WordCraft"))
