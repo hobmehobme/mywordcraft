@@ -47,6 +47,22 @@ jobs:
           "$SDKM" "build-tools;36.0.0" "ndk;${NDK_VERSION}" "platforms;android-35"
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
+      - name: Bangun jembatan keyboard sistem (Java ke DEX)
+        # Jika langkah ini gagal, APK tetap dibangun tanpa jembatan (keyboard sistem hanya huruf Latin).
+        run: |
+          B=apps/wordcraft-android/ime
+          ANDROID_JAR="$ANDROID_HOME/platforms/android-35/android.jar"
+          : > "$B/classes.dex"
+          if rm -rf "$B/out" && mkdir -p "$B/out/classes" \
+            && javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d "$B/out/classes" "$B/ImeBridge.java" \
+            && "$ANDROID_HOME/build-tools/36.0.0/d8" --min-api 26 --lib "$ANDROID_JAR" --output "$B/out" $(find "$B/out/classes" -name '*.class') \
+            && cp "$B/out/classes.dex" "$B/classes.dex"; then
+            echo "jembatan keyboard: dibangun"
+          else
+            echo "::warning::jembatan keyboard gagal dibangun; APK tanpa jembatan"
+          fi
+          ls -l "$B/classes.dex"
+
       - name: Pasang cargo-apk
         run: |
           if ! command -v cargo-apk >/dev/null; then
