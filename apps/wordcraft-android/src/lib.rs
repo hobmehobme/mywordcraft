@@ -5,13 +5,13 @@
 //!
 //! Done: the Start screen (File › Home) on launch, one window, the app's private folder for
 //! recovery copies, Open and Save in shared storage through the built-in file browser (needs "All
-//! files access", which the bottom strip asks for and reports), an on-screen keyboard that only
-//! shows when asked for, an interface size that shrinks on short screens (a phone in landscape) so
-//! dialogs fit, and an Arabic keyboard of the app's own (a `NativeActivity` gets no text from the
-//! system keyboard's non-Latin layouts, so it cannot type Arabic). Mouse input and the wheel come
-//! from a patched winit (`patches/winit-android-mouse.patch`, applied by the build workflow).
-//! Not yet done: the Android file pickers (Storage Access Framework, which needs Java glue),
-//! preferences loading and saving, the keyboard's inset, and touch-sized controls.
+//! files access", which the bottom strip asks for and reports), an interface size that shrinks on
+//! short screens (a phone in landscape) so dialogs fit, and the system keyboard for any language
+//! (see `ime`: a `NativeActivity` gets no text from it otherwise, so Arabic did not type). Mouse,
+//! wheel and modifier keys (Ctrl, Shift, Alt) come from a patched winit
+//! (`patches/winit-android-mouse.patch`, applied by the build workflow).
+//! Not yet done: the Android file pickers (Storage Access Framework), preferences loading and
+//! saving, the keyboard's inset, sharing the clipboard with other apps, and touch-sized controls.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 /// The entry point `NativeActivity` calls. Unsafe code in this crate: this `no_mangle`
@@ -32,7 +32,7 @@ mod storage {
 
     /// Runs `f` on this thread with a JNI environment and the activity. `None` when it fails (a
     /// Java exception is cleared and logged).
-    fn with_activity<R>(app: &AndroidApp, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<R>) -> Option<R> {
+    pub(crate) fn with_activity<R>(app: &AndroidApp, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<R>) -> Option<R> {
         // SAFETY: android-activity documents both pointers as valid for as long as the activity
         // lives, and this runs on the app's own thread while it does.
         let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
@@ -79,6 +79,92 @@ mod storage {
     }
 }
 
+/// The system keyboard's text. A `NativeActivity` has no input connection, so a keyboard sends it
+/// only keys that have a key code and nothing for Arabic. `ime/ImeBridge.java` (compiled to DEX by
+/// the build workflow, embedded here, and loaded from memory) adds a view that has one, and this
+/// module reads what it queued.
+#[cfg(target_os = "android")]
+mod ime {
+    use jni::objects::{GlobalRef, JClass, JString, JValue};
+    use winit::platform::android::activity::AndroidApp;
+
+    use crate::storage::with_activity;
+
+    /// The compiled bridge; empty when the build could not make it.
+    const BRIDGE_DEX: &[u8] = include_bytes!("../ime/classes.dex");
+
+    /// The bridge's class, as `ImeBridge.java` declares it.
+    const BRIDGE_CLASS: &str = "app.wordcraft.ime.ImeBridge";
+
+    /// What the keyboard did to the text.
+    pub enum Operation {
+        /// Delete this many characters before the caret.
+        Delete(usize),
+        Type(String),
+        Enter,
+    }
+
+    /// A running bridge (the Java object).
+    pub struct Bridge {
+        object: GlobalRef,
+    }
+
+    /// Loads the bridge and adds its view. `None` when the build has no bridge or loading fails.
+    pub fn start(app: &AndroidApp) -> Option<Bridge> {
+        if BRIDGE_DEX.is_empty() {
+            log::warn!("this build has no keyboard bridge: the system keyboard types Latin letters only");
+            return None;
+        }
+        with_activity(app, |env, activity| {
+            let bytes = env.byte_array_from_slice(BRIDGE_DEX)?;
+            let buffer = env.call_static_method("java/nio/ByteBuffer", "wrap", "([B)Ljava/nio/ByteBuffer;", &[JValue::Object(&bytes)])?.l()?;
+            let parent = env.call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
+            let loader = env.new_object(
+                "dalvik/system/InMemoryDexClassLoader",
+                "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+                &[JValue::Object(&buffer), JValue::Object(&parent)],
+            )?;
+            let name = env.new_string(BRIDGE_CLASS)?;
+            let class = JClass::from(env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])?.l()?);
+            let object = env.call_static_method(&class, "create", "(Landroid/app/Activity;)Lapp/wordcraft/ime/ImeBridge;", &[JValue::Object(activity)])?.l()?;
+            let object = env.new_global_ref(object)?;
+            Ok(Bridge { object })
+        })
+    }
+
+    impl Bridge {
+        /// Shows or hides the system keyboard.
+        pub fn show(&self, app: &AndroidApp, visible: bool) {
+            let _ = with_activity(app, |env, _| env.call_method(self.object.as_obj(), "show", "(Z)V", &[JValue::Bool(u8::from(visible))]).map(|_| ()));
+        }
+
+        /// What the keyboard typed since the last call.
+        pub fn poll(&self, app: &AndroidApp) -> Vec<Operation> {
+            let text = with_activity(app, |env, _| {
+                let value = env.call_method(self.object.as_obj(), "poll", "()Ljava/lang/String;", &[])?.l()?;
+                if value.as_raw().is_null() {
+                    return Ok(None);
+                }
+                let text: String = env.get_string(&JString::from(value))?.into();
+                Ok(Some(text))
+            })
+            .flatten();
+            let Some(text) = text else { return Vec::new() };
+            text.split('\u{1f}')
+                .filter_map(|op| {
+                    let rest = op.get(1..)?;
+                    match op.chars().next()? {
+                        'D' => rest.parse().ok().map(Operation::Delete),
+                        'T' => Some(Operation::Type(rest.to_string())),
+                        'E' => Some(Operation::Enter),
+                        _ => None,
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
 #[cfg(target_os = "android")]
 mod host {
     use std::path::{Path, PathBuf};
@@ -117,158 +203,6 @@ mod host {
     /// How often the bottom strip looks at the storage permission again (after Settings).
     const STORAGE_CHECK_EVERY: Duration = Duration::from_secs(1);
 
-    /// Name of the Arabic font added to the interface fonts for the keyboard's keys.
-    const ARABIC_FONT_NAME: &str = "android arabic keys";
-
-    /// Folders of Android's own fonts.
-    const SYSTEM_FONT_DIRS: [&str; 3] = ["/system/fonts", "/system/product/fonts", "/product/fonts"];
-
-    /// Fonts that draw Arabic, best first.
-    const ARABIC_FONT_FILES: [&str; 4] = ["NotoNaskhArabic-Regular.ttf", "NotoNaskhArabicUI-Regular.ttf", "NotoSansArabic-Regular.ttf", "NotoSansArabicUI-Regular.ttf"];
-
-    /// Largest font file read for the keys (a regular Arabic face is well under 1 MB).
-    const ARABIC_FONT_MAX_BYTES: u64 = 8 << 20;
-
-    const LETTER_ROWS: [&[&str]; 4] = [
-        &["ض", "ص", "ث", "ق", "ف", "غ", "ع", "ه", "خ", "ح", "ج", "د"],
-        &["ش", "س", "ي", "ب", "ل", "ا", "ت", "ن", "م", "ك", "ط"],
-        &["ئ", "ء", "ؤ", "ر", "لا", "ى", "ة", "و", "ز", "ظ", "ذ"],
-        &["أ", "إ", "آ", "،", "؛", "؟", "ـ"],
-    ];
-
-    /// Fatha, fathatan, damma, dammatan, kasra, kasratan / sukun, shadda, dagger alef, maddah,
-    /// hamza above, hamza below.
-    const MARK_ROWS: [&[&str]; 2] = [
-        &["\u{064E}", "\u{064B}", "\u{064F}", "\u{064C}", "\u{0650}", "\u{064D}"],
-        &["\u{0652}", "\u{0651}", "\u{0670}", "\u{0653}", "\u{0654}", "\u{0655}"],
-    ];
-
-    const DIGIT_ROWS: [&[&str]; 3] = [
-        &["١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩", "٠"],
-        &["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
-        &[".", ":", "-", "(", ")", "/", "%", "!", "\"", "'"],
-    ];
-
-    /// Which keys the Arabic keyboard shows.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Layer {
-        Letters,
-        Marks,
-        Digits,
-    }
-
-    /// The Arabic keyboard drawn by the app: tapped keys reach the document as ordinary text and
-    /// key events, the way a hardware keyboard's do.
-    struct ArabicKeys {
-        open: bool,
-        layer: Layer,
-        /// An Arabic font read from the system, for the keys' labels.
-        font: Option<Vec<u8>>,
-        /// Keys tapped, handed to the app at the start of the next frame.
-        pending: Vec<egui::Event>,
-    }
-
-    impl ArabicKeys {
-        fn new() -> Self {
-            let font = load_arabic_font();
-            match &font {
-                Some(bytes) => log::info!("Arabic keys font: {} bytes", bytes.len()),
-                None => log::warn!("no Arabic font found in the system font folders: the Arabic keys will draw as boxes"),
-            }
-            Self { open: false, layer: Layer::Letters, font, pending: Vec::new() }
-        }
-
-        /// Adds the Arabic font to the interface fonts, again whenever the app has replaced them.
-        fn ensure_font(&self, ctx: &egui::Context) {
-            let Some(bytes) = &self.font else { return };
-            if ctx.fonts(|f| f.definitions().font_data.contains_key(ARABIC_FONT_NAME)) {
-                return;
-            }
-            ctx.add_font(egui::FontInsert {
-                name: ARABIC_FONT_NAME.to_string(),
-                data: egui::FontData::from_owned(bytes.clone()),
-                families: vec![egui::InsertFontFamily { family: egui::FontFamily::Proportional, priority: egui::FontPriority::Lowest }],
-            });
-        }
-
-        fn type_text(&mut self, ctx: &egui::Context, text: &str) {
-            self.pending.push(egui::Event::Text(text.to_string()));
-            ctx.request_repaint();
-        }
-
-        fn press(&mut self, ctx: &egui::Context, key: egui::Key) {
-            for pressed in [true, false] {
-                self.pending.push(egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE });
-            }
-            ctx.request_repaint();
-        }
-
-        fn show(&mut self, ui: &mut egui::Ui) {
-            let rows: Vec<&[&str]> = match self.layer {
-                Layer::Letters => LETTER_ROWS.to_vec(),
-                Layer::Marks => MARK_ROWS.to_vec(),
-                Layer::Digits => DIGIT_ROWS.to_vec(),
-            };
-            let spacing = 4.0;
-            ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
-            let widest = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(10) as f32;
-            let key_w = ((ui.available_width() - spacing * (widest - 1.0)) / widest).clamp(26.0, 52.0);
-            let key = egui::vec2(key_w, 42.0);
-            let ctx = ui.ctx().clone();
-
-            for row in rows {
-                ui.horizontal(|ui| {
-                    let row_w = row.len() as f32 * key_w + (row.len() as f32 - 1.0) * spacing;
-                    ui.add_space(((ui.available_width() - row_w) / 2.0).max(0.0));
-                    for &k in row {
-                        // A mark is shown on a tatweel, so it has something to sit on.
-                        let label = if self.layer == Layer::Marks { format!("\u{0640}{k}") } else { k.to_string() };
-                        if ui.add(egui::Button::new(egui::RichText::new(label).size(22.0)).min_size(key)).clicked() {
-                            self.type_text(&ctx, k);
-                        }
-                    }
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.layer, Layer::Letters, "ابج");
-                ui.selectable_value(&mut self.layer, Layer::Marks, "\u{0640}\u{064E}");
-                ui.selectable_value(&mut self.layer, Layer::Digits, "١٢٣");
-                if ui.add(egui::Button::new("Space").min_size(egui::vec2(key_w * 4.0, 42.0))).clicked() {
-                    self.type_text(&ctx, " ");
-                }
-                if ui.add(egui::Button::new("Back").min_size(egui::vec2(key_w * 1.5, 42.0))).clicked() {
-                    self.press(&ctx, egui::Key::Backspace);
-                }
-                if ui.add(egui::Button::new("Enter").min_size(egui::vec2(key_w * 1.5, 42.0))).clicked() {
-                    self.press(&ctx, egui::Key::Enter);
-                }
-            });
-        }
-    }
-
-    /// The bytes of an Arabic font among Android's own, if any.
-    fn load_arabic_font() -> Option<Vec<u8>> {
-        let read = |path: &Path| std::fs::metadata(path).ok().filter(|m| m.len() <= ARABIC_FONT_MAX_BYTES).and_then(|_| std::fs::read(path).ok());
-        for dir in SYSTEM_FONT_DIRS {
-            for name in ARABIC_FONT_FILES {
-                if let Some(bytes) = read(&Path::new(dir).join(name)) {
-                    return Some(bytes);
-                }
-            }
-        }
-        for dir in SYSTEM_FONT_DIRS {
-            let Ok(entries) = std::fs::read_dir(dir) else { continue };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let regular = name.contains("Arabic") && !name.contains("Bold") && !name.contains("Italic") && (name.ends_with(".ttf") || name.ends_with(".otf"));
-                if let Some(bytes) = regular.then(|| read(&entry.path())).flatten() {
-                    return Some(bytes);
-                }
-            }
-        }
-        None
-    }
-
     /// What the bottom strip says about shared storage.
     struct StorageStatus {
         /// Whether "All files access" is on; `None` when Android does not say.
@@ -305,13 +239,46 @@ mod host {
         /// Whether the on-screen keyboard may show. Off at start: a document that always asks for
         /// the keyboard would bring it up on every tap and cover the page.
         keyboard: bool,
-        keys: ArabicKeys,
+        /// The system keyboard's text, when the build has the bridge for it.
+        ime: Option<crate::ime::Bridge>,
+        /// Whether the bridge was last told to show the keyboard.
+        ime_shown: bool,
+        /// Keys typed on the system keyboard, handed to the app at the start of the next frame.
+        typed: Vec<egui::Event>,
         storage: StorageStatus,
         /// The screen height, in pixels, the interface size was last fitted to.
         fitted_for: Option<u32>,
     }
 
     impl Shell {
+        /// Shows or hides the system keyboard as the strip's switch says, and turns what it typed
+        /// into the input events a hardware keyboard would give.
+        fn read_system_keyboard(&mut self, ctx: &egui::Context) {
+            let Some(bridge) = &self.ime else { return };
+            if self.keyboard != self.ime_shown {
+                bridge.show(&self.activity, self.keyboard);
+                self.ime_shown = self.keyboard;
+            }
+            if !self.keyboard {
+                return;
+            }
+            let key = |key: egui::Key| {
+                [true, false].map(|pressed| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE })
+            };
+            for operation in bridge.poll(&self.activity) {
+                match operation {
+                    crate::ime::Operation::Delete(count) => (0..count.min(1000)).for_each(|_| self.typed.extend(key(egui::Key::Backspace))),
+                    crate::ime::Operation::Type(text) => self.typed.push(egui::Event::Text(text)),
+                    crate::ime::Operation::Enter => self.typed.extend(key(egui::Key::Enter)),
+                }
+            }
+            if !self.typed.is_empty() {
+                ctx.request_repaint();
+            }
+            // The keyboard types in the background: look again soon, not once a second.
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+
         /// Sets the interface size for the screen's height whenever that height changes. The user can
         /// still pick another size in Options; it stays until the screen changes again.
         fn fit_interface(&mut self, ctx: &egui::Context) {
@@ -335,7 +302,7 @@ mod host {
         }
 
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
-            raw.events.append(&mut self.keys.pending);
+            raw.events.append(&mut self.typed);
             self.app.raw_input_hook(ctx, raw);
         }
 
@@ -345,6 +312,7 @@ mod host {
                 self.storage.refresh(&self.activity);
             }
             ui.ctx().request_repaint_after(STORAGE_CHECK_EVERY);
+            self.read_system_keyboard(ui.ctx());
 
             egui::Panel::top("android_status_bar_space").show(ui, |ui| {
                 ui.set_height(STATUS_BAR_POINTS);
@@ -353,21 +321,19 @@ mod host {
                 ui.spacing_mut().button_padding = egui::vec2(14.0, 8.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.toggle_value(&mut self.keyboard, "On-screen keyboard");
-                    ui.toggle_value(&mut self.keys.open, "Arabic keyboard");
+                    if self.ime.is_none() {
+                        ui.weak("(keyboard: Latin only)");
+                    }
                     if self.storage.allowed == Some(false) && ui.button("Allow file access").clicked() {
                         storage::open_all_files_settings(&self.activity);
                     }
                     ui.weak(&self.storage.text);
                 });
             });
-            if self.keys.open {
-                self.keys.ensure_font(ui.ctx());
-                egui::Panel::bottom("android_arabic_keys").show(ui, |ui| self.keys.show(ui));
-            }
             self.app.ui(ui);
             // Without an input method request the system keeps the keyboard hidden. A hardware
             // keyboard still types: its keys arrive as ordinary key and text events.
-            if !self.keyboard {
+            if !self.keyboard || self.ime.is_some() {
                 ui.ctx().output_mut(|o| o.ime = None);
             }
         }
@@ -431,7 +397,8 @@ mod host {
                     }
                 }
                 let storage = StorageStatus { allowed: None, text: String::new(), checked: None };
-                Ok(Box::new(Shell { app, activity, keyboard: false, keys: ArabicKeys::new(), storage, fitted_for: None }))
+                let ime = crate::ime::start(&activity);
+                Ok(Box::new(Shell { app, activity, keyboard: false, ime, ime_shown: false, typed: Vec::new(), storage, fitted_for: None }))
             }),
         );
         if let Err(e) = result {
