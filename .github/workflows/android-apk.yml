@@ -19,6 +19,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Tambalan winit (mouse dikenali sebagai mouse, roda scroll)
+        run: |
+          WINIT_REV=a517b3846ee8457d84ee4975110bfda6797c44dc
+          git clone --quiet https://github.com/storytold/winit.git "$RUNNER_TEMP/winit"
+          git -C "$RUNNER_TEMP/winit" checkout --quiet "$WINIT_REV"
+          git -C "$RUNNER_TEMP/winit" apply "$GITHUB_WORKSPACE/patches/winit-android-mouse.patch"
+          python3 - <<'PY'
+          import os, re
+          s = open("Cargo.toml", encoding="utf-8").read()
+          new = 'winit = { path = "%s" }' % os.path.join(os.environ["RUNNER_TEMP"], "winit")
+          s, n = re.subn(r'^winit = \{ git = "https://github.com/storytold/winit.git"[^\n]*\}$', new, s, flags=re.M)
+          assert n == 1, "baris patch winit di Cargo.toml tidak ditemukan"
+          open("Cargo.toml", "w", encoding="utf-8").write(s)
+          PY
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
