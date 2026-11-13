@@ -1,0 +1,75 @@
+--- a/src/platform_impl/android/mod.rs
++++ b/src/platform_impl/android/mod.rs
+@@ -377,6 +377,64 @@
+                 let window_id = window::WindowId(WindowId);
+                 let device_id = event::DeviceId(DeviceId(motion_event.device_id()));
+ 
++                let first = motion_event.pointer_at_index(motion_event.pointer_index());
++                if matches!(first.tool_type(), android_activity::input::ToolType::Mouse) {
++                    // A mouse is not a finger: report its cursor, buttons and wheel as a mouse's.
++                    let position = PhysicalPosition { x: first.x() as f64, y: first.y() as f64 };
++                    let moved = event::WindowEvent::CursorMoved { device_id, position };
++                    let mut events = Vec::new();
++                    match motion_event.action() {
++                        MotionAction::HoverEnter => {
++                            events.push(event::WindowEvent::CursorEntered { device_id });
++                            events.push(moved);
++                        },
++                        MotionAction::Down
++                        | MotionAction::Up
++                        | MotionAction::Move
++                        | MotionAction::HoverMove => events.push(moved),
++                        MotionAction::HoverExit | MotionAction::Cancel => {
++                            events.push(event::WindowEvent::CursorLeft { device_id })
++                        },
++                        MotionAction::ButtonPress | MotionAction::ButtonRelease => {
++                            let state = if matches!(motion_event.action(), MotionAction::ButtonPress)
++                            {
++                                event::ElementState::Pressed
++                            } else {
++                                event::ElementState::Released
++                            };
++                            let button = match motion_event.action_button() {
++                                android_activity::input::Button::Primary => event::MouseButton::Left,
++                                android_activity::input::Button::Secondary => {
++                                    event::MouseButton::Right
++                                },
++                                android_activity::input::Button::Tertiary => {
++                                    event::MouseButton::Middle
++                                },
++                                android_activity::input::Button::Back => event::MouseButton::Back,
++                                android_activity::input::Button::Forward => {
++                                    event::MouseButton::Forward
++                                },
++                                _ => event::MouseButton::Other(0),
++                            };
++                            events.push(moved);
++                            events.push(event::WindowEvent::MouseInput { device_id, state, button });
++                        },
++                        MotionAction::Scroll => {
++                            let h = first.axis_value(android_activity::input::Axis::Hscroll);
++                            let v = first.axis_value(android_activity::input::Axis::Vscroll);
++                            events.push(moved);
++                            events.push(event::WindowEvent::MouseWheel {
++                                device_id,
++                                delta: event::MouseScrollDelta::LineDelta(h, v),
++                                phase: event::TouchPhase::Moved,
++                            });
++                        },
++                        _ => {},
++                    }
++                    for event in events {
++                        callback(event::Event::WindowEvent { window_id, event }, self.window_target());
++                    }
++                } else {
+                 let phase = match motion_event.action() {
+                     MotionAction::Down | MotionAction::PointerDown => {
+                         Some(event::TouchPhase::Started)
+@@ -421,6 +479,7 @@
+                         callback(event, self.window_target());
+                     }
+                 }
++                }
+             },
+             InputEvent::KeyEvent(key) => {
+                 match key.key_code() {
