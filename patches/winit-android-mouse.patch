@@ -1,9 +1,51 @@
 --- a/src/platform_impl/android/mod.rs
 +++ b/src/platform_impl/android/mod.rs
-@@ -377,6 +377,64 @@
+@@ -34,6 +34,28 @@
+ 
+ static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
+ 
++/// The modifier keys last reported to the application, as `ModifiersState` bits.
++static MODIFIERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++
++/// The modifier keys that Android says are held, from the meta state of an input event.
++fn modifiers_of(meta: android_activity::input::MetaState) -> crate::keyboard::ModifiersState {
++    use crate::keyboard::ModifiersState;
++    let mut state = ModifiersState::empty();
++    if meta.shift_on() {
++        state |= ModifiersState::SHIFT;
++    }
++    if meta.ctrl_on() {
++        state |= ModifiersState::CONTROL;
++    }
++    if meta.alt_on() {
++        state |= ModifiersState::ALT;
++    }
++    if meta.meta_on() {
++        state |= ModifiersState::SUPER;
++    }
++    state
++}
++
+ /// Returns the minimum `Option<Duration>`, taking into account that `None`
+ /// equates to an infinite timeout, not a zero timeout (so can't just use
+ /// `Option::min`)
+@@ -377,6 +399,77 @@
                  let window_id = window::WindowId(WindowId);
                  let device_id = event::DeviceId(DeviceId(motion_event.device_id()));
  
++                // Android sends no "modifiers changed" event: take them from the event's meta
++                // state, so Ctrl + wheel and Shift + wheel reach the application as such.
++                let held = modifiers_of(motion_event.meta_state());
++                if MODIFIERS.swap(held.bits(), Ordering::Relaxed) != held.bits() {
++                    callback(
++                        event::Event::WindowEvent {
++                            window_id,
++                            event: event::WindowEvent::ModifiersChanged(held.into()),
++                        },
++                        self.window_target(),
++                    );
++                }
++
 +                let first = motion_event.pointer_at_index(motion_event.pointer_index());
 +                if matches!(first.tool_type(), android_activity::input::ToolType::Mouse) {
 +                    // A mouse is not a finger: report its cursor, buttons and wheel as a mouse's.
@@ -65,11 +107,23 @@
                  let phase = match motion_event.action() {
                      MotionAction::Down | MotionAction::PointerDown => {
                          Some(event::TouchPhase::Started)
-@@ -421,6 +479,7 @@
+@@ -421,8 +514,19 @@
                          callback(event, self.window_target());
                      }
                  }
 +                }
              },
              InputEvent::KeyEvent(key) => {
++                let held = modifiers_of(key.meta_state());
++                if MODIFIERS.swap(held.bits(), Ordering::Relaxed) != held.bits() {
++                    callback(
++                        event::Event::WindowEvent {
++                            window_id: window::WindowId(WindowId),
++                            event: event::WindowEvent::ModifiersChanged(held.into()),
++                        },
++                        self.window_target(),
++                    );
++                }
                  match key.key_code() {
+                     // Flag keys related to volume as unhandled. While winit does not have a way for
+                     // applications to configure what keys to flag as handled,
