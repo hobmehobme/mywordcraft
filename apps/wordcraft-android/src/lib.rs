@@ -3,11 +3,15 @@
 //! Runs the same [`wordcraft_ui_egui::WordApp`] as the desktop and web apps, on a `NativeActivity`
 //! through eframe's wgpu backend. Build with `cargo apk build -p wordcraft-android --lib`.
 //!
-//! Done: the sample document, one window, the app's private folder for recovery copies, Open and
-//! Save in shared storage through the built-in file browser (needs "All files access", which the
-//! bottom strip asks for and reports), and an on-screen keyboard that only shows when asked for.
+//! Done: the Start screen (File › Home) on launch, one window, the app's private folder for
+//! recovery copies, Open and Save in shared storage through the built-in file browser (needs "All
+//! files access", which the bottom strip asks for and reports), an on-screen keyboard that only
+//! shows when asked for, an interface size that shrinks on short screens (a phone in landscape) so
+//! dialogs fit, and an Arabic keyboard of the app's own (a `NativeActivity` gets no text from the
+//! system keyboard's non-Latin layouts, so it cannot type Arabic). Mouse input and the wheel come
+//! from a patched winit (`patches/winit-android-mouse.patch`, applied by the build workflow).
 //! Not yet done: the Android file pickers (Storage Access Framework, which needs Java glue),
-//! preferences loading and saving, user fonts, the keyboard's inset, and touch-sized controls.
+//! preferences loading and saving, the keyboard's inset, and touch-sized controls.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 /// The entry point `NativeActivity` calls. Unsafe code in this crate: this `no_mangle`
@@ -82,6 +86,7 @@ mod host {
     use std::time::{Duration, Instant};
 
     use eframe::egui;
+    use serde_json::json;
     use winit::platform::android::activity::AndroidApp;
     use wordcraft_engine::Session;
     use wordcraft_ui_egui::{Services, WordApp};
@@ -95,8 +100,174 @@ mod host {
     /// Shared storage of the main user: Documents, Download, and so on.
     const SHARED_STORAGE: &str = "/storage/emulated/0";
 
+    /// The least screen height, in points, the interface is drawn for: a dialog such as Save As
+    /// needs about this much with the status bar and the bottom strip. A shorter screen (a phone
+    /// in landscape) gets a smaller interface size; a tablet keeps the system's own (Auto).
+    const MIN_LOGICAL_HEIGHT: f32 = 600.0;
+
+    /// The interface size, in percent, that gives a screen `px_height` pixels tall at least
+    /// [`MIN_LOGICAL_HEIGHT`] points; `None` (Auto) when the system's own scale already does.
+    fn fitted_percent(px_height: f32, native: f32) -> Option<u16> {
+        if px_height / native.max(0.1) >= MIN_LOGICAL_HEIGHT {
+            return None;
+        }
+        Some((px_height / MIN_LOGICAL_HEIGHT * 100.0).floor().clamp(50.0, 300.0) as u16)
+    }
+
     /// How often the bottom strip looks at the storage permission again (after Settings).
     const STORAGE_CHECK_EVERY: Duration = Duration::from_secs(1);
+
+    /// Name of the Arabic font added to the interface fonts for the keyboard's keys.
+    const ARABIC_FONT_NAME: &str = "android arabic keys";
+
+    /// Folders of Android's own fonts.
+    const SYSTEM_FONT_DIRS: [&str; 3] = ["/system/fonts", "/system/product/fonts", "/product/fonts"];
+
+    /// Fonts that draw Arabic, best first.
+    const ARABIC_FONT_FILES: [&str; 4] = ["NotoNaskhArabic-Regular.ttf", "NotoNaskhArabicUI-Regular.ttf", "NotoSansArabic-Regular.ttf", "NotoSansArabicUI-Regular.ttf"];
+
+    /// Largest font file read for the keys (a regular Arabic face is well under 1 MB).
+    const ARABIC_FONT_MAX_BYTES: u64 = 8 << 20;
+
+    const LETTER_ROWS: [&[&str]; 4] = [
+        &["ض", "ص", "ث", "ق", "ف", "غ", "ع", "ه", "خ", "ح", "ج", "د"],
+        &["ش", "س", "ي", "ب", "ل", "ا", "ت", "ن", "م", "ك", "ط"],
+        &["ئ", "ء", "ؤ", "ر", "لا", "ى", "ة", "و", "ز", "ظ", "ذ"],
+        &["أ", "إ", "آ", "،", "؛", "؟", "ـ"],
+    ];
+
+    /// Fatha, fathatan, damma, dammatan, kasra, kasratan / sukun, shadda, dagger alef, maddah,
+    /// hamza above, hamza below.
+    const MARK_ROWS: [&[&str]; 2] = [
+        &["\u{064E}", "\u{064B}", "\u{064F}", "\u{064C}", "\u{0650}", "\u{064D}"],
+        &["\u{0652}", "\u{0651}", "\u{0670}", "\u{0653}", "\u{0654}", "\u{0655}"],
+    ];
+
+    const DIGIT_ROWS: [&[&str]; 3] = [
+        &["١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩", "٠"],
+        &["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
+        &[".", ":", "-", "(", ")", "/", "%", "!", "\"", "'"],
+    ];
+
+    /// Which keys the Arabic keyboard shows.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Layer {
+        Letters,
+        Marks,
+        Digits,
+    }
+
+    /// The Arabic keyboard drawn by the app: tapped keys reach the document as ordinary text and
+    /// key events, the way a hardware keyboard's do.
+    struct ArabicKeys {
+        open: bool,
+        layer: Layer,
+        /// An Arabic font read from the system, for the keys' labels.
+        font: Option<Vec<u8>>,
+        /// Keys tapped, handed to the app at the start of the next frame.
+        pending: Vec<egui::Event>,
+    }
+
+    impl ArabicKeys {
+        fn new() -> Self {
+            let font = load_arabic_font();
+            match &font {
+                Some(bytes) => log::info!("Arabic keys font: {} bytes", bytes.len()),
+                None => log::warn!("no Arabic font found in the system font folders: the Arabic keys will draw as boxes"),
+            }
+            Self { open: false, layer: Layer::Letters, font, pending: Vec::new() }
+        }
+
+        /// Adds the Arabic font to the interface fonts, again whenever the app has replaced them.
+        fn ensure_font(&self, ctx: &egui::Context) {
+            let Some(bytes) = &self.font else { return };
+            if ctx.fonts(|f| f.definitions().font_data.contains_key(ARABIC_FONT_NAME)) {
+                return;
+            }
+            ctx.add_font(egui::FontInsert {
+                name: ARABIC_FONT_NAME.to_string(),
+                data: egui::FontData::from_owned(bytes.clone()),
+                families: vec![egui::InsertFontFamily { family: egui::FontFamily::Proportional, priority: egui::FontPriority::Lowest }],
+            });
+        }
+
+        fn type_text(&mut self, ctx: &egui::Context, text: &str) {
+            self.pending.push(egui::Event::Text(text.to_string()));
+            ctx.request_repaint();
+        }
+
+        fn press(&mut self, ctx: &egui::Context, key: egui::Key) {
+            for pressed in [true, false] {
+                self.pending.push(egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE });
+            }
+            ctx.request_repaint();
+        }
+
+        fn show(&mut self, ui: &mut egui::Ui) {
+            let rows: Vec<&[&str]> = match self.layer {
+                Layer::Letters => LETTER_ROWS.to_vec(),
+                Layer::Marks => MARK_ROWS.to_vec(),
+                Layer::Digits => DIGIT_ROWS.to_vec(),
+            };
+            let spacing = 4.0;
+            ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+            let widest = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(10) as f32;
+            let key_w = ((ui.available_width() - spacing * (widest - 1.0)) / widest).clamp(26.0, 52.0);
+            let key = egui::vec2(key_w, 42.0);
+            let ctx = ui.ctx().clone();
+
+            for row in rows {
+                ui.horizontal(|ui| {
+                    let row_w = row.len() as f32 * key_w + (row.len() as f32 - 1.0) * spacing;
+                    ui.add_space(((ui.available_width() - row_w) / 2.0).max(0.0));
+                    for &k in row {
+                        // A mark is shown on a tatweel, so it has something to sit on.
+                        let label = if self.layer == Layer::Marks { format!("\u{0640}{k}") } else { k.to_string() };
+                        if ui.add(egui::Button::new(egui::RichText::new(label).size(22.0)).min_size(key)).clicked() {
+                            self.type_text(&ctx, k);
+                        }
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.layer, Layer::Letters, "ابج");
+                ui.selectable_value(&mut self.layer, Layer::Marks, "\u{0640}\u{064E}");
+                ui.selectable_value(&mut self.layer, Layer::Digits, "١٢٣");
+                if ui.add(egui::Button::new("Space").min_size(egui::vec2(key_w * 4.0, 42.0))).clicked() {
+                    self.type_text(&ctx, " ");
+                }
+                if ui.add(egui::Button::new("Back").min_size(egui::vec2(key_w * 1.5, 42.0))).clicked() {
+                    self.press(&ctx, egui::Key::Backspace);
+                }
+                if ui.add(egui::Button::new("Enter").min_size(egui::vec2(key_w * 1.5, 42.0))).clicked() {
+                    self.press(&ctx, egui::Key::Enter);
+                }
+            });
+        }
+    }
+
+    /// The bytes of an Arabic font among Android's own, if any.
+    fn load_arabic_font() -> Option<Vec<u8>> {
+        let read = |path: &Path| std::fs::metadata(path).ok().filter(|m| m.len() <= ARABIC_FONT_MAX_BYTES).and_then(|_| std::fs::read(path).ok());
+        for dir in SYSTEM_FONT_DIRS {
+            for name in ARABIC_FONT_FILES {
+                if let Some(bytes) = read(&Path::new(dir).join(name)) {
+                    return Some(bytes);
+                }
+            }
+        }
+        for dir in SYSTEM_FONT_DIRS {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let regular = name.contains("Arabic") && !name.contains("Bold") && !name.contains("Italic") && (name.ends_with(".ttf") || name.ends_with(".otf"));
+                if let Some(bytes) = regular.then(|| read(&entry.path())).flatten() {
+                    return Some(bytes);
+                }
+            }
+        }
+        None
+    }
 
     /// What the bottom strip says about shared storage.
     struct StorageStatus {
@@ -134,7 +305,28 @@ mod host {
         /// Whether the on-screen keyboard may show. Off at start: a document that always asks for
         /// the keyboard would bring it up on every tap and cover the page.
         keyboard: bool,
+        keys: ArabicKeys,
         storage: StorageStatus,
+        /// The screen height, in pixels, the interface size was last fitted to.
+        fitted_for: Option<u32>,
+    }
+
+    impl Shell {
+        /// Sets the interface size for the screen's height whenever that height changes. The user can
+        /// still pick another size in Options; it stays until the screen changes again.
+        fn fit_interface(&mut self, ctx: &egui::Context) {
+            let px = (ctx.content_rect().height() * ctx.pixels_per_point()).round() as u32;
+            if self.fitted_for == Some(px) {
+                return;
+            }
+            self.fitted_for = Some(px);
+            let Some(native) = ctx.native_pixels_per_point() else { return };
+            let percent = fitted_percent(px as f32, native).map_or(json!("auto"), |p| json!(p));
+            match self.app.run("ui.interfaceSize", json!({ "percent": percent })) {
+                Ok(_) => log::info!("interface size {percent} for a screen {px} px tall"),
+                Err(e) => log::warn!("cannot set the interface size: {e}"),
+            }
+        }
     }
 
     impl eframe::App for Shell {
@@ -143,10 +335,12 @@ mod host {
         }
 
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+            raw.events.append(&mut self.keys.pending);
             self.app.raw_input_hook(ctx, raw);
         }
 
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+            self.fit_interface(ui.ctx());
             if self.storage.due() {
                 self.storage.refresh(&self.activity);
             }
@@ -159,12 +353,17 @@ mod host {
                 ui.spacing_mut().button_padding = egui::vec2(14.0, 8.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.toggle_value(&mut self.keyboard, "On-screen keyboard");
+                    ui.toggle_value(&mut self.keys.open, "Arabic keyboard");
                     if self.storage.allowed == Some(false) && ui.button("Allow file access").clicked() {
                         storage::open_all_files_settings(&self.activity);
                     }
                     ui.weak(&self.storage.text);
                 });
             });
+            if self.keys.open {
+                self.keys.ensure_font(ui.ctx());
+                egui::Panel::bottom("android_arabic_keys").show(ui, |ui| self.keys.show(ui));
+            }
             self.app.ui(ui);
             // Without an input method request the system keeps the keyboard hidden. A hardware
             // keyboard still types: its keys arrive as ordinary key and text events.
@@ -208,7 +407,7 @@ mod host {
             options,
             Box::new(move |cc| {
                 let region = wordcraft_ui_egui::i18n::system_region();
-                let mut session = Session::new(wordcraft_engine::sample::sample_document());
+                let mut session = Session::new(wordcraft_engine::blank_document(&region));
                 session.system_region = region;
                 let services = Services {
                     // Android's own pickers need Java glue; an `Err` makes the app show its
@@ -223,6 +422,8 @@ mod host {
                 let mut app = WordApp::new(session, services);
                 // Updates arrive through the app store, not from inside the app.
                 app.disable_self_update();
+                // Like the desktop app: launch on File › Home (unless its Start screen option is off).
+                let _ = app.start_screen();
                 if let Some(dir) = wordcraft_control_key::settings_dir() {
                     let ctx = cc.egui_ctx.clone();
                     if let Err(e) = app.session.enable_recovery(dir.join("recovery"), Arc::new(move || ctx.request_repaint())) {
@@ -230,7 +431,7 @@ mod host {
                     }
                 }
                 let storage = StorageStatus { allowed: None, text: String::new(), checked: None };
-                Ok(Box::new(Shell { app, activity, keyboard: false, storage }))
+                Ok(Box::new(Shell { app, activity, keyboard: false, keys: ArabicKeys::new(), storage, fitted_for: None }))
             }),
         );
         if let Err(e) = result {
