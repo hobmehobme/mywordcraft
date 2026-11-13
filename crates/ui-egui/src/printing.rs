@@ -160,6 +160,7 @@ pub fn pwg_media(paper: &str) -> Option<&'static str> {
         "Executive" => "na_executive_7.25x10.5in",
         "A3" => "iso_a3_297x420mm",
         "A4" => "iso_a4_210x297mm",
+        "F4" => "om_f4_215x330mm",
         "A5" => "iso_a5_148x210mm",
         "B4 (JIS)" => "jis_b4_257x364mm",
         "B5 (JIS)" => "jis_b5_182x257mm",
